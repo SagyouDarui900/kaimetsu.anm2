@@ -1,0 +1,148 @@
+--label:変形
+--information:ファミコン風スプライトバグ再現
+--track@cell_size:セル大きさ,4,64,16,1
+--track@repetition:繰り返し,0,256,20,1
+--track@direction:連続方向,0,3,0,1
+--check@curtain:カーテン,1
+
+--filter
+
+if (obj.w or 0) <= 0 or (obj.h or 0) <= 0 then
+    return
+end
+
+local ceil = math.ceil
+local floor = math.floor
+local max = math.max
+local min = math.min
+local sqrt = math.sqrt
+
+local param_cell_size = max(cell_size or 16, 1)
+local param_repetition = min(max(repetition or 20, 0), 256)
+local param_direction = floor(direction or 0) % 4
+local use_curtain = (curtain == 1 or curtain == true)
+
+-- 連続方向の事前回転（回数指定: 1=90度, 2=180度, 3=270度）
+if param_direction ~= 0 then
+    obj.effect("ローテーション", "90度回転", param_direction)
+end
+
+local bn = ceil(param_cell_size)
+local w, h = obj.w, obj.h
+local w_bn, h_bn = max(1, ceil(w / bn)), max(1, ceil(h / bn))
+
+local pad_t = floor((h_bn * bn - h) / 2)
+local pad_b = ceil((h_bn * bn - h) / 2)
+local pad_l = floor((w_bn * bn - w) / 2)
+local pad_r = ceil((w_bn * bn - w) / 2)
+
+obj.effect("領域拡張", "上", pad_t, "下", pad_b, "左", pad_l, "右", pad_r, "塗りつぶし", 1)
+
+w, h = w_bn * bn, h_bn * bn
+
+-- 縮小画像から各セルの平均色を取得
+obj.copybuffer("tempbuffer", "object")
+obj.effect("リサイズ", "拡大率", 100 / bn, "補間なし", 0)
+
+local total_cells = w_bn * h_bn
+local celldata = {}
+
+obj.pixeloption("type", "rgb")
+for i = 0, h_bn - 1 do
+    local row_offset = i * w_bn
+    for j = 0, w_bn - 1 do
+        local r, g, b, a = obj.getpixel(j, i)
+        celldata[row_offset + j + 1] = {
+            { r or 0, g or 0, b or 0, a or 0 },
+            nil,
+            row_offset + j + 1
+        }
+    end
+end
+
+-- 元画像から各セルの中心色を取得
+obj.copybuffer("object", "tempbuffer")
+obj.pixeloption("get", "object")
+
+local half_bn = floor(bn / 2)
+for i = 0, h_bn - 1 do
+    local row_offset = i * w_bn
+    local sample_y = i * bn + half_bn
+    for j = 0, w_bn - 1 do
+        local r, g, b, a = obj.getpixel(j * bn + half_bn, sample_y)
+        celldata[row_offset + j + 1][2] = { r or 0, g or 0, b or 0, a or 0 }
+    end
+end
+
+-- 色距離計算（アルファ乗算距離）
+local function cd(rgb1, rgb2)
+    local a1 = rgb1[4] or 0
+    local a2 = rgb2[4] or 0
+    local dr = (rgb1[1] * a1 - rgb2[1] * a2)
+    local dg = (rgb1[2] * a1 - rgb2[2] * a2)
+    local db = (rgb1[3] * a1 - rgb2[3] * a2)
+    return sqrt(dr * dr + dg * dg + db * db) / 255.0
+end
+
+obj.setoption("drawtarget", "tempbuffer", w, h)
+obj.setoption("sampler", "clamp")
+
+local vertex_batch = {}
+local batch_count = 0
+
+-- タイル連鎖マージ処理
+for i = 0, h_bn - 1 do
+    local row_offset = i * w_bn
+    for j = 0, w_bn - 1 do
+        local idx = row_offset + j + 1
+        local idx_dx = row_offset + j
+        local idx_dy = row_offset + j + 1 - w_bn
+
+        -- 左セルとのマージ判定
+        if j > 0 and min(
+            cd(celldata[idx][1], celldata[celldata[idx_dx][3]][1]),
+            cd(celldata[idx][2], celldata[celldata[idx_dx][3]][2])
+        ) < param_repetition then
+            celldata[idx][3] = celldata[idx_dx][3]
+        end
+
+        -- 上セルとのマージ判定
+        if i > 0 and min(
+            cd(celldata[idx][1], celldata[celldata[idx_dy][3]][1]),
+            cd(celldata[idx][2], celldata[celldata[idx_dy][3]][2])
+        ) < param_repetition then
+            celldata[idx][3] = celldata[idx_dy][3]
+        end
+
+        local src_idx = celldata[idx][3] - 1
+        local _j = src_idx % w_bn
+        local _i = floor(src_idx / w_bn)
+
+        -- 描画ポリゴン生成
+        if use_curtain or (celldata[idx][1][4] or 0) > 0 then
+            local x0, y0 = j * bn - w / 2, i * bn - h / 2
+            local x1, y1 = x0 + bn, y0 + bn
+
+            local u0, v0 = _j * bn, _i * bn
+            local u1, v1 = u0 + bn, v0 + bn
+
+            -- 時計回り（左上 -> 右上 -> 右下 -> 左下）にUVを正しく対応付け
+            batch_count = batch_count + 1
+            vertex_batch[batch_count] = {
+                x0, y0, 0,  x1, y0, 0,  x1, y1, 0,  x0, y1, 0, -- 頂点座標
+                u0, v0,     u1, v0,     u1, v1,     u0, v1      -- UV座標
+            }
+        end
+    end
+end
+
+if batch_count > 0 then
+    obj.drawpoly(vertex_batch)
+end
+
+obj.copybuffer("object", "tempbuffer")
+
+-- 回転の復元
+if param_direction ~= 0 then
+    obj.effect("ローテーション", "90度回転", -param_direction)
+end
